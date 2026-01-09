@@ -1,6 +1,6 @@
 // src/config.js
 export const CFG = {
-  symbols: ["BEATUSDT", "DOGEUSDT", "SHIBUSDT", "PEPEUSDT"],
+  symbols: ["ZECUSDT", "DOGEUSDT", "ETHUSDT", "PEPEUSDT"],
 
   timeframe: "5m",
   barMs: 5 * 60 * 1000,
@@ -24,11 +24,11 @@ export const CFG = {
 
   guards: {
     // ✅ per-guard toggles
-    cooldownEnabled: true,     // cek cooldownUntil + set cooldown onStopLoss
-    minGapEnabled: true,       // minMinutesBetweenEntries
-    maxTradesEnabled: true,    // maxTradesPerDay
-    killSwitchEnabled: true,   // pausedUntil + stopEvents window
-    armedEnabled: true,        // armedLong/armedShort anti spam
+    cooldownEnabled: false,     // cek cooldownUntil + set cooldown onStopLoss
+    minGapEnabled: false,       // minMinutesBetweenEntries
+    maxTradesEnabled: false,    // maxTradesPerDay
+    killSwitchEnabled: false,   // pausedUntil + stopEvents window
+    armedEnabled: false,        // armedLong/armedShort anti spam
     debounce: true,            // sudah ada (crossing) vs touch
 
     cooldownBarsAfterSL: 2,
