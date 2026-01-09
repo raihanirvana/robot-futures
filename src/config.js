@@ -1,6 +1,6 @@
 // src/config.js
 export const CFG = {
-  symbols: ["ZECUSDT", "DOGEUSDT", "ETHUSDT", "PEPEUSDT"],
+  symbols: ["SOLUSDT", "DOGEUSDT", "ETHUSDT", "PEPEUSDT"],
 
   timeframe: "5m",
   barMs: 5 * 60 * 1000,
