@@ -22,32 +22,18 @@ export function createState(symbol) {
   return {
     symbol,
 
-    // exchange rules
-    rules: null, // { stepSize, minQty, maxQty?, tickSize, minNotional? }
+    rules: null, // { stepSize, minQty, tickSize, minNotional? }
+    bb: null,
 
-    // indicators
-    bb: null,    // { upper, middle, lower, width, longTrigger, shortTrigger, updatedAt }
-
-    // position state
     position: {
-      side: "NONE",       // NONE | LONG | SHORT
+      side: "NONE",
       qty: 0,
-      entryPrice: null,   // avg fill price
-      entryMark: null     // mark at submit time (fallback)
+      entryPrice: null,
+      entryMark: null
     },
 
     tp1Hit: false,
 
-    // pending order (extended for safety)
-    // {
-    //   type: "ENTRY"|"EXIT",
-    //   clientId, side,
-    //   reason?, mode?, qty,
-    //   markAtSubmit, since,
-    //   targetPx?,
-    //   filledCum?: number,          // cumulative filled qty seen so far
-    //   cancelRequestedAt?: number   // avoid spamming cancel
-    // }
     pending: null,
 
     armedLong: false,
@@ -63,11 +49,9 @@ export function createState(symbol) {
     pausedUntil: 0,
     stopEvents: [],
 
-    // concurrency
     inFlight: false,
     queuedMark: null,
 
-    // stats
     dayRealizedPnl: 0,
     dayWins: 0,
     dayLosses: 0,

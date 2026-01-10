@@ -81,15 +81,19 @@ export function connectUserWS({ listenKey, onOrderTradeUpdate }) {
   }
 
   function scheduleReconnect() {
-    if (!alive) return;
+  if (!alive) return;
 
-    clearReconnectTimer();
+  // ✅ kalau sudah ada timer, jangan schedule lagi (hindari retry double)
+  if (reconnectTimer) return;
 
-    retry += 1;
-    const base = Math.min(30_000, 1000 * (2 ** Math.min(5, retry)));
-    const jitter = Math.floor(Math.random() * 1000);
-    reconnectTimer = setTimeout(connect, base + jitter);
-  }
+  retry += 1;
+  const base = Math.min(30_000, 1000 * (2 ** Math.min(5, retry)));
+  const jitter = Math.floor(Math.random() * 1000);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null; // ✅ reset sebelum connect
+    connect();
+  }, base + jitter);
+}
 
   connect();
 

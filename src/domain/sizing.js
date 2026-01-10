@@ -1,16 +1,19 @@
 // src/domain/sizing.js
 
 function decimalsFromSize(size) {
-  const s = String(size).trim().toLowerCase();
+  const s0 = String(size).trim().toLowerCase();
 
   // support "1e-8"
-  if (s.includes("e-")) {
-    const m = s.match(/e-(\d+)/);
+  if (s0.includes("e-")) {
+    const m = s0.match(/e-(\d+)/);
     if (m) return Number(m[1]) || 0;
   }
 
-  if (!s.includes(".")) return 0;
-  return s.split(".")[1].length;
+  if (!s0.includes(".")) return 0;
+
+  // ✅ strip trailing zeros so "0.10" => 1 decimal, not 2
+  const frac = s0.split(".")[1].replace(/0+$/, "");
+  return frac.length;
 }
 
 export function roundDownToStep(qty, stepSize) {
@@ -34,6 +37,7 @@ export function roundDownToStep(qty, stepSize) {
 
 /**
  * Convert qty number -> safe string based on stepSize decimals
+ * ✅ trims trailing zeros
  */
 export function formatQtyByStep(qty, stepSize) {
   const q = Number(qty);
@@ -47,6 +51,7 @@ export function formatQtyByStep(qty, stepSize) {
 
 /**
  * Convert price -> safe string based on tickSize decimals
+ * ✅ trims trailing zeros
  */
 export function formatPriceByTick(price, tickSize) {
   const p = Number(price);

@@ -37,62 +37,82 @@ function newCid(prefix, symbol, nowMs) {
   return `${prefix}_${symbol}_${nowMs}_${rand}`;
 }
 
-// ===== Tick helpers =====
-function decimalsFromTick(tickSize) {
-  const s = String(tickSize).trim().toLowerCase();
-  if (s.includes("e-")) {
-    const m = s.match(/e-(\d+)/);
-    if (m) return Number(m[1]) || 0;
-  }
-  if (!s.includes(".")) return 0;
-  return s.split(".")[1].length;
+// ===== Hedge mode detection =====
+let isHedgeMode = false;
+function maybeAddPositionSide(order, side /* "LONG" | "SHORT" */) {
+  if (!isHedgeMode) return order;
+  return { ...order, positionSide: side };
 }
 
-function formatPriceByTick(price, tickSize, side) {
+// ===== Helpers for decimals (IMPORTANT: strip trailing zeros) =====
+function decimalsFromSize(size) {
+  const s0 = String(size).trim().toLowerCase();
+  if (s0.includes("e-")) {
+    const m = s0.match(/e-(\d+)/);
+    if (m) return Number(m[1]) || 0;
+  }
+  if (!s0.includes(".")) return 0;
+  const frac = s0.split(".")[1].replace(/0+$/, ""); // strip trailing zeros (0.10 -> 1 dp)
+  return frac.length;
+}
+
+/**
+ * Snap price to tick size using integer math.
+ * roundMode: "FLOOR" | "CEIL"
+ */
+function formatLimitPriceSnap(price, tickSize, roundMode) {
   const px = Number(price);
   const tick = Number(tickSize);
 
   if (!Number.isFinite(px) || px <= 0) return null;
   if (!Number.isFinite(tick) || tick <= 0) return String(px);
 
-  const steps = px / tick;
-  const roundedSteps =
-    side === "LONG"
-      ? Math.floor(steps + 1e-12)
-      : Math.ceil(steps - 1e-12);
+  const d = decimalsFromSize(tickSize);
+  const scale = 10 ** Math.min(d, 12);
 
-  const outPx = roundedSteps * tick;
-  const d = decimalsFromTick(tickSize);
+  const pxInt = Math.floor(px * scale + 1e-9);
+  const tickInt = Math.floor(tick * scale + 1e-9);
+  if (tickInt <= 0) return String(px);
+
+  const snappedInt =
+    roundMode === "FLOOR"
+      ? Math.floor(pxInt / tickInt) * tickInt
+      : Math.ceil(pxInt / tickInt) * tickInt;
+
+  const outPx = snappedInt / scale;
 
   let out = outPx.toFixed(Math.min(d, 12));
   if (out.includes(".")) out = out.replace(/\.?0+$/, "");
   return out;
 }
 
-// ✅ apply entrySlipTicks
-function computeEntryLimitPrice(st, side) {
+/**
+ * Entry LIMIT: start from trigger, apply slipTicks, clamp vs mark a bit.
+ */
+function computeEntryLimitPrice(st, side, mark) {
   if (!st.bb) return null;
-  const trigger = side === "LONG" ? st.bb.longTrigger : st.bb.shortTrigger;
 
-  const slipTicks = Number(CFG.exec.entrySlipTicks ?? 0);
+  let px = side === "LONG" ? st.bb.longTrigger : st.bb.shortTrigger;
+  if (!Number.isFinite(px)) return null;
+
+  const slip = Number(CFG.exec.entrySlipTicks ?? 0);
   const tick = Number(st.rules?.tickSize ?? 0);
 
-  if (!Number.isFinite(trigger)) return null;
-  if (!Number.isFinite(slipTicks) || slipTicks === 0) return trigger;
-  if (!Number.isFinite(tick) || tick <= 0) return trigger;
+  if (Number.isFinite(slip) && slip !== 0 && Number.isFinite(tick) && tick > 0) {
+    // LONG buy: push up; SHORT sell: push down
+    px = side === "LONG" ? (px + slip * tick) : (px - slip * tick);
+  }
 
-  // LONG: BUY LIMIT -> a bit higher improves fill; SHORT: SELL LIMIT -> a bit lower improves fill
-  const adj = slipTicks * tick;
-  return side === "LONG" ? (trigger + adj) : (trigger - adj);
-}
+  // optional safety clamp (avoid far away limit price)
+  const m = Number(mark);
+  if (Number.isFinite(m) && m > 0) {
+    const maxDev = 0.02; // 2%
+    const hi = m * (1 + maxDev);
+    const lo = m * (1 - maxDev);
+    px = Math.max(lo, Math.min(hi, px));
+  }
 
-// ===== Hedge mode helper =====
-function maybeAddPositionSide(order, sideForHedge) {
-  if ((CFG.exec.positionMode || "ONE_WAY") !== "HEDGE") return order;
-
-  // In hedge mode, Binance expects positionSide LONG/SHORT
-  const ps = sideForHedge === "LONG" ? "LONG" : "SHORT";
-  return { ...order, positionSide: ps };
+  return px;
 }
 
 // ===== Per-symbol containers =====
@@ -199,6 +219,20 @@ async function safeInit() {
     CFG.exec.entryType
   );
 
+  // Detect hedge mode if endpoint exists
+  try {
+    if (typeof BinanceRest.getPositionSideDual === "function") {
+      const dual = await BinanceRest.getPositionSideDual(CFG.exec.recvWindow);
+      isHedgeMode = !!dual?.dualSidePosition;
+      log("[BOOT] dualSidePosition =", dual, "=> hedgeMode=", isHedgeMode);
+    } else {
+      isHedgeMode = false;
+    }
+  } catch (e) {
+    log("[BOOT] getPositionSideDual FAIL (assume one-way):", e?.response?.data || e.message);
+    isHedgeMode = false;
+  }
+
   for (const s of SYMS) await initSymbol(s);
   await startUserStream();
 
@@ -282,27 +316,72 @@ function computePartialQty(st, fullQty) {
 async function syncPositionFromExchange(st) {
   try {
     const arr = await BinanceRest.positionRisk(st.symbol, CFG.exec.recvWindow);
-    const p = Array.isArray(arr) ? arr[0] : null;
-    if (!p) return;
+    if (!Array.isArray(arr) || arr.length === 0) return;
 
-    const amt = Number(p.positionAmt || 0);
-    const entry = Number(p.entryPrice || 0);
+    // filter by symbol (defensive)
+    const ps = arr.filter((x) => (x?.symbol || "") === st.symbol);
+    if (ps.length === 0) return;
 
-    if (!Number.isFinite(amt) || amt === 0) {
+    // ONE_WAY: biasanya 1 item positionSide=BOTH, positionAmt bisa +/- (long/short)
+    if (!isHedgeMode) {
+      const p = ps[0];
+      const amt = Number(p?.positionAmt || 0);
+      const entry = Number(p?.entryPrice || 0);
+
+      if (!Number.isFinite(amt) || amt === 0) {
+        st.position = { side: "NONE", qty: 0, entryPrice: null, entryMark: null };
+        st.tp1Hit = false;
+        return;
+      }
+
+      st.position.side = amt > 0 ? "LONG" : "SHORT";
+      st.position.qty = Math.abs(amt);
+      st.position.entryPrice = Number.isFinite(entry) && entry > 0 ? entry : st.position.entryPrice;
+      return;
+    }
+
+    // HEDGE: ada 2 item (LONG & SHORT) => pilih yang non-zero
+    const longP = ps.find((x) => x?.positionSide === "LONG") || null;
+    const shortP = ps.find((x) => x?.positionSide === "SHORT") || null;
+
+    const longAmt = Math.abs(Number(longP?.positionAmt || 0));
+    const shortAmt = Math.abs(Number(shortP?.positionAmt || 0));
+
+    const longHas = Number.isFinite(longAmt) && longAmt > 0;
+    const shortHas = Number.isFinite(shortAmt) && shortAmt > 0;
+
+    // kalau dua sisi kebuka, bot strategy kamu sebenarnya “nggak siap”
+    if (longHas && shortHas) {
+      log("[SYNC] BOTH SIDES OPEN in hedge mode -> PAUSE", st.symbol, { longAmt, shortAmt });
+      st.pausedUntil = Math.max(st.pausedUntil || 0, Date.now() + 60_000);
+      return;
+    }
+
+    if (!longHas && !shortHas) {
       st.position = { side: "NONE", qty: 0, entryPrice: null, entryMark: null };
       st.tp1Hit = false;
       return;
     }
 
-    if (!st.position) st.position = { side: "NONE", qty: 0, entryPrice: null, entryMark: null };
+    if (longHas) {
+      const entry = Number(longP?.entryPrice || 0);
+      st.position.side = "LONG";
+      st.position.qty = longAmt;
+      st.position.entryPrice = Number.isFinite(entry) && entry > 0 ? entry : st.position.entryPrice;
+      return;
+    }
 
-    st.position.side = amt > 0 ? "LONG" : "SHORT";
-    st.position.qty = Math.abs(amt);
+    // shortHas
+    const entry = Number(shortP?.entryPrice || 0);
+    st.position.side = "SHORT";
+    st.position.qty = shortAmt;
     st.position.entryPrice = Number.isFinite(entry) && entry > 0 ? entry : st.position.entryPrice;
+
   } catch (e) {
     log("[SYNC] positionRisk FAIL", st.symbol, e?.response?.data || e.message);
   }
 }
+
 
 async function hardReleaseStuckPending(st, nowMs) {
   if (!st.pending) return false;
@@ -359,7 +438,7 @@ async function maybeCancelStuckPending(st, nowMs) {
   const age = nowMs - (st.pending.since || nowMs);
   if (age < CFG.exec.pendingTimeoutMs) return;
 
-  if (st.pending.cancelRequestedAt) return; // ✅ cancel once
+  if (st.pending.cancelRequestedAt) return; // cancel once
   st.pending.cancelRequestedAt = nowMs;
 
   const { clientId, type } = st.pending;
@@ -397,7 +476,7 @@ async function enterPosition(st, side, mark, nowMs) {
   st.pending = { type: "ENTRY", clientId, side, qty, markAtSubmit: mark, since: nowMs, filledCum: 0 };
 
   try {
-    let baseOrder = {
+    let order = {
       symbol: st.symbol,
       side: side === "LONG" ? "BUY" : "SELL",
       type: CFG.exec.entryType,
@@ -406,24 +485,27 @@ async function enterPosition(st, side, mark, nowMs) {
       recvWindow: CFG.exec.recvWindow
     };
 
-    baseOrder = maybeAddPositionSide(baseOrder, side);
-
+    // LIMIT entry
     if (CFG.exec.entryType === "LIMIT") {
-      const triggerPx = computeEntryLimitPrice(st, side);
-      if (triggerPx == null) throw new Error("No triggerPx");
+      const desiredPx = computeEntryLimitPrice(st, side, mark);
+      if (desiredPx == null) throw new Error("No desiredPx");
 
-      const pxStr = formatPriceByTick(triggerPx, st.rules?.tickSize, side);
+      // BUY -> CEIL, SELL -> FLOOR
+      const roundMode = side === "LONG" ? "CEIL" : "FLOOR";
+      const pxStr = formatLimitPriceSnap(desiredPx, st.rules?.tickSize, roundMode);
       if (!pxStr) throw new Error("Bad limit price");
 
-      baseOrder.price = pxStr;
-      baseOrder.timeInForce = CFG.exec.entryTimeInForce || "IOC";
+      order.price = pxStr;
+      order.timeInForce = CFG.exec.entryTimeInForce || "IOC";
 
-      log("[ENTER]", st.symbol, side, "LIMIT", "mark=", fmt(mark), "trigger=", fmt(triggerPx), "price=", pxStr, "qty=", qtyStr, "cid=", clientId);
+      log("[ENTER]", st.symbol, side, "LIMIT", "mark=", fmt(mark), "desired=", fmt(desiredPx), "price=", pxStr, "qty=", qtyStr, "cid=", clientId);
     } else {
       log("[ENTER]", st.symbol, side, "MARKET", "mark=", fmt(mark), "qty=", qtyStr, "cid=", clientId);
     }
 
-    await BinanceRest.placeOrder(baseOrder);
+    order = maybeAddPositionSide(order, side);
+
+    await BinanceRest.placeOrder(order);
 
   } catch (e) {
     log("[ENTER] Order failed:", st.symbol, e?.response?.data || e.message);
@@ -462,7 +544,8 @@ async function exitPosition(st, reason, mark, nowMs, mode = "FULL", targetPx = n
     markAtSubmit: mark,
     since: nowMs,
     targetPx,
-    filledCum: 0
+    filledCum: 0,
+    slGuardApplied: false
   };
 
   log("[EXIT]", st.symbol, reason, mode, side, "mark=", fmt(mark), "qty=", fmt(qty, 8), "fullQty=", fmt(fullQty, 8), "target=", targetPx != null ? fmt(targetPx) : "na", "cid=", clientId);
@@ -482,12 +565,29 @@ async function exitPosition(st, reason, mark, nowMs, mode = "FULL", targetPx = n
 
     await BinanceRest.placeOrder(order);
   } catch (e) {
+    const code = e?.response?.data?.code;
+    const msg = e?.response?.data?.msg || e.message;
     log("[EXIT] Order failed:", st.symbol, e?.response?.data || e.message);
+
+    // ReduceOnly rejected -> state desync; sync then stop spam
+    if (code === -2022) {
+      log("[EXIT] ReduceOnly rejected -> sync position & pause", st.symbol, msg);
+      await syncPositionFromExchange(st);
+
+      if (st.position.side === "NONE" || Number(st.position.qty) <= 0) {
+        st.pending = null;
+        st.tp1Hit = false;
+        st.pausedUntil = Math.max(st.pausedUntil || 0, Date.now() + 30_000);
+        log("[EXIT] Position already flat -> state cleared + pause30s", st.symbol);
+        return;
+      }
+    }
+
     st.pending = null;
   }
 }
 
-// latest mark overwrite
+// ===== Mark processing with queue =====
 function handleMark(payload) {
   const st = symState.get(payload.symbol);
   if (!st) return;
@@ -529,7 +629,7 @@ async function processMark(st, { markPrice }) {
     return;
   }
 
-  // pending: allow catastrophic SL even while pending EXIT/ENTRY
+  // ===== Pending state: still allow catastrophic SL if we already have position =====
   if (st.pending) {
     const side = st.position.side;
     const hasPos = (side !== "NONE" && Number(st.position.qty) > 0);
@@ -544,6 +644,7 @@ async function processMark(st, { markPrice }) {
           (side === "SHORT" && mark >= slBB);
 
         if (slHit) {
+          // cancel pending order first (best-effort)
           try {
             if (st.pending?.clientId) {
               await BinanceRest.cancelOrder({ symbol: st.symbol, origClientOrderId: st.pending.clientId, recvWindow: CFG.exec.recvWindow });
@@ -573,7 +674,7 @@ async function processMark(st, { markPrice }) {
   const armedEnabled = (CFG.guards?.armedEnabled !== false);
   resetArmedOnReenterBand(st, mark, armedEnabled);
 
-  // EXIT management
+  // ===== EXIT management =====
   if (st.position.side !== "NONE") {
     const side = st.position.side;
     const entry = st.position.entryPrice ?? st.position.entryMark ?? mark;
@@ -607,7 +708,7 @@ async function processMark(st, { markPrice }) {
     return;
   }
 
-  // ENTRY
+  // ===== ENTRY =====
   if (!canEnterNow(st, CFG, nowWall)) {
     st.prevMark = mark;
     return;
@@ -625,7 +726,7 @@ async function processMark(st, { markPrice }) {
   st.prevMark = mark;
 }
 
-// ✅ EXIT partial fill safe using cum delta
+// ===== User stream handler (ENTRY terminal w/ partial fill handled) =====
 function handleOrderTradeUpdate(msg) {
   try {
     const o = msg.o;
@@ -639,8 +740,9 @@ function handleOrderTradeUpdate(msg) {
     ensureDay(st, nowWall);
     perf.ensureDay(symbol, nowWall);
 
-    const status = o.X;          // NEW, PARTIALLY_FILLED, FILLED, CANCELED, REJECTED, EXPIRED
-    const side = o.S;            // BUY / SELL
+    const status = o.X; // NEW, PARTIALLY_FILLED, FILLED, CANCELED, REJECTED, EXPIRED
+    const side = o.S;   // BUY / SELL
+
     const avgPrice = Number(o.ap || 0);
     const cumFilledQty = Number(o.z || 0);
     const lastFillPrice = Number(o.L || 0);
@@ -648,6 +750,7 @@ function handleOrderTradeUpdate(msg) {
 
     const terminal = (status === "FILLED" || status === "CANCELED" || status === "REJECTED" || status === "EXPIRED");
 
+    // Not our pending -> still refine entryPrice if it matches current position direction
     if (!st.pending || st.pending.clientId !== clientId) {
       if ((status === "FILLED" || status === "PARTIALLY_FILLED") && cumFilledQty > 0) {
         if (st.position.side === "LONG" && side === "BUY") st.position.entryPrice = avgPrice || st.position.entryPrice;
@@ -656,30 +759,52 @@ function handleOrderTradeUpdate(msg) {
       return;
     }
 
-    // ENTRY pending
+    // ===== Pending ENTRY =====
     if (st.pending.type === "ENTRY") {
-      if (status === "PARTIALLY_FILLED" && cumFilledQty > 0) {
-        const newSide = (side === "BUY") ? "LONG" : "SHORT";
+      const newSide = (side === "BUY") ? "LONG" : "SHORT";
+
+      if ((status === "PARTIALLY_FILLED" || status === "FILLED") && cumFilledQty > 0) {
         st.position.side = newSide;
         st.position.qty = cumFilledQty;
         st.position.entryPrice = avgPrice || st.position.entryPrice;
         st.position.entryMark = st.pending.markAtSubmit ?? null;
-        return;
       }
 
-      if (status === "FILLED" && cumFilledQty > 0) {
-        const newSide = (side === "BUY") ? "LONG" : "SHORT";
-        st.position.side = newSide;
-        st.position.qty = cumFilledQty;
-        st.position.entryPrice = avgPrice || null;
-        st.position.entryMark = st.pending.markAtSubmit ?? null;
-
+      // ✅ If terminal but cumFilledQty > 0 (IOC EXPIRED/CANCELED after partial fill)
+      if (terminal && cumFilledQty > 0) {
         st.tp1Hit = false;
         st.tradesToday += 1;
         st.lastEntryAt = nowWall;
 
         const entryRef = Number(st.position.entryPrice ?? st.position.entryMark ?? 0);
+        const tp1 = tp1Price(entryRef, st.position.side);
+        const tp2 = tp2Price(entryRef, st.position.side);
+        const sl = slPriceBBRelative(st, st.position.side);
 
+        perf.recordEntry({
+          symbol,
+          side: st.position.side,
+          entryPrice: entryRef,
+          qty: cumFilledQty,
+          nowMs: nowWall,
+          clientId,
+          tp1,
+          tp2,
+          sl
+        });
+
+        log("[USER] ENTRY DONE (terminal with fills)", symbol, "cid=", clientId, "status=", status, "side=", st.position.side, "entry=", fmt(entryRef), "qty=", fmt(cumFilledQty, 8));
+
+        st.pending = null;
+        return;
+      }
+
+      if (status === "FILLED" && cumFilledQty > 0) {
+        st.tp1Hit = false;
+        st.tradesToday += 1;
+        st.lastEntryAt = nowWall;
+
+        const entryRef = Number(st.position.entryPrice ?? st.position.entryMark ?? 0);
         const tp1 = tp1Price(entryRef, st.position.side);
         const tp2 = tp2Price(entryRef, st.position.side);
         const sl = slPriceBBRelative(st, st.position.side);
@@ -705,6 +830,7 @@ function handleOrderTradeUpdate(msg) {
       if (terminal && status !== "FILLED") {
         log("[USER] ENTRY terminal(not filled)", symbol, clientId, "status=", status);
 
+        // release armed flags
         const armedEnabled = (CFG.guards?.armedEnabled !== false);
         if (armedEnabled) {
           if (st.pending.side === "LONG") st.armedLong = false;
@@ -714,10 +840,11 @@ function handleOrderTradeUpdate(msg) {
         st.pending = null;
         return;
       }
+
       return;
     }
 
-    // EXIT pending
+    // ===== Pending EXIT (delta fill safe) =====
     if (st.pending.type === "EXIT") {
       const prevCum = Number(st.pending.filledCum || 0);
       const currCum = Number.isFinite(cumFilledQty) ? cumFilledQty : 0;
@@ -730,13 +857,16 @@ function handleOrderTradeUpdate(msg) {
         const mode = st.pending.mode;
 
         const entryRef = Number(st.position.entryPrice ?? st.position.entryMark ?? 0);
+
         const fillPx = (Number.isFinite(lastFillPrice) && lastFillPrice > 0)
           ? lastFillPrice
           : (Number.isFinite(avgPrice) && avgPrice > 0 ? avgPrice : 0);
 
+        const posSideBefore = st.position.side;
+
         let pnlUSDT = 0;
         if (deltaQty > 0 && entryRef > 0 && fillPx > 0) {
-          pnlUSDT = (st.position.side === "LONG")
+          pnlUSDT = (posSideBefore === "LONG")
             ? (fillPx - entryRef) * deltaQty
             : (entryRef - fillPx) * deltaQty;
 
@@ -769,21 +899,26 @@ function handleOrderTradeUpdate(msg) {
         if (newQty <= 0) {
           st.position = { side: "NONE", qty: 0, entryPrice: null, entryMark: null };
           st.tp1Hit = false;
-        }
 
-        if (reason === "SL_BB") {
-          onStopLoss(st, CFG, nowWall);
-          log("[GUARD] SL confirmed", symbol, "cooldownUntil=", new Date(st.cooldownUntil).toISOString(), "pausedUntil=", st.pausedUntil ? new Date(st.pausedUntil).toISOString() : "none");
+          // apply SL guard once when fully flat
+          if (reason === "SL_BB" && !st.pending.slGuardApplied) {
+            st.pending.slGuardApplied = true;
+            onStopLoss(st, CFG, nowWall);
+            log("[GUARD] SL confirmed", symbol, "cooldownUntil=", new Date(st.cooldownUntil).toISOString(), "pausedUntil=", st.pausedUntil ? new Date(st.pausedUntil).toISOString() : "none");
+          }
         }
       }
 
       if (status === "FILLED") {
+        syncPositionFromExchange(st).catch(() => {});
         st.pending = null;
         return;
       }
 
       if (terminal && status !== "FILLED") {
         log("[USER] EXIT terminal", symbol, clientId, "status=", status, "cumQty=", fmt(cumFilledQty, 8));
+        // reconcile if needed
+        syncPositionFromExchange(st).catch(() => {});
         st.pending = null;
         return;
       }
@@ -796,6 +931,7 @@ function handleOrderTradeUpdate(msg) {
   }
 }
 
+// ===== graceful shutdown =====
 let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;

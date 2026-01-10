@@ -54,9 +54,8 @@ export const BinanceRest = {
     const mlot = pickFilter(s, "MARKET_LOT_SIZE");
     const price = pickFilter(s, "PRICE_FILTER");
 
-    // ✅ minNotional (kalau ada)
-    // Binance futures exchangeInfo kadang punya MIN_NOTIONAL, kadang tidak tergantung market.
-    const minNotionalF = pickFilter(s, "MIN_NOTIONAL");
+    // Futures kadang punya MIN_NOTIONAL atau NOTIONAL (tergantung environment)
+    const minNotionalF = pickFilter(s, "MIN_NOTIONAL") || pickFilter(s, "NOTIONAL");
     const notional = minNotionalF?.notional ?? minNotionalF?.minNotional ?? null;
 
     return {
@@ -66,7 +65,7 @@ export const BinanceRest = {
 
       tickSize: price?.tickSize ?? "0.00000001",
 
-      // optional constraint
+      // optional constraint (best-effort)
       minNotional: notional != null ? String(notional) : null
     };
   },
@@ -101,6 +100,12 @@ export const BinanceRest = {
 
   async positionRisk(symbol, recvWindow = 5000) {
     return signed("GET", "/fapi/v2/positionRisk", { symbol, recvWindow });
+  },
+
+  // ✅ Hedge mode detect (dualSidePosition)
+  // return shape: { dualSidePosition: true/false } (Binance API)
+  async getPositionSideDual(recvWindow = 5000) {
+    return signed("GET", "/fapi/v1/positionSide/dual", { recvWindow });
   },
 
   async startListenKey() {

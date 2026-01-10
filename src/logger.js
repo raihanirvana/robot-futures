@@ -13,7 +13,6 @@ function isoJakarta(tsMs) {
 }
 
 export function createPerfLogger({ log }) {
-  // per-symbol perf + open session
   const perf = new Map();
 
   function get(sym) {
@@ -22,14 +21,7 @@ export function createPerfLogger({ log }) {
         dayKey: dayKeyJakarta(Date.now()),
         day: { sessions: 0, wins: 0, losses: 0, be: 0, netUSDT: 0 },
         total: { sessions: 0, wins: 0, losses: 0, be: 0, netUSDT: 0 },
-
-        // open session (entry -> multiple exits)
         open: null
-        // open = {
-        //   entryAtMs, entryCid, side, entryPrice, qtyOpen,
-        //   tp1, tp2, sl,
-        //   realizedUSDT
-        // }
       });
     }
     return perf.get(sym);
@@ -40,7 +32,6 @@ export function createPerfLogger({ log }) {
     const dk = dayKeyJakarta(nowMs);
     if (dk === p.dayKey) return;
 
-    // print yesterday summary
     log(
       `[DAY] ${symbol} ${p.dayKey} sessions=${p.day.sessions} ` +
       `W=${p.day.wins} L=${p.day.losses} BE=${p.day.be} ` +
@@ -54,7 +45,6 @@ export function createPerfLogger({ log }) {
   function recordEntry({ symbol, side, entryPrice, qty, nowMs, clientId, tp1, tp2, sl }) {
     const p = get(symbol);
 
-    // overwrite open session if any (shouldn't happen normally)
     p.open = {
       entryAtMs: nowMs,
       entryCid: clientId || null,
@@ -93,7 +83,6 @@ export function createPerfLogger({ log }) {
     const p = get(symbol);
     const open = p.open;
 
-    // Kalau open session belum ada (misal bot restart), tetap log exit-nya
     if (!open) {
       log(
         `[EXIT] ${symbol} ${isoJakarta(nowMs)} reason=${reason} mode=${mode} ` +
@@ -104,7 +93,6 @@ export function createPerfLogger({ log }) {
       return;
     }
 
-    // update open session
     open.realizedUSDT += Number(pnlUSDT || 0);
     open.qtyOpen = Math.max(0, Number(remainingQty ?? open.qtyOpen));
 
@@ -118,7 +106,6 @@ export function createPerfLogger({ log }) {
 
     if (!isFinal) return;
 
-    // finalize session (count as 1 trade)
     const net = open.realizedUSDT;
     p.day.sessions += 1;
     p.total.sessions += 1;

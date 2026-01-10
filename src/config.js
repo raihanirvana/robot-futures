@@ -31,7 +31,7 @@ export const CFG = {
     armedEnabled: false,
     debounce: false,
 
-    // ✅ defaults aman (tidak undefined)
+    // defaults aman (tidak undefined)
     cooldownBarsAfterSL: 2,
     minMinutesBetweenEntries: 30,
     maxTradesPerDay: 10,
@@ -44,12 +44,14 @@ export const CFG = {
   },
 
   exec: {
-    // ✅ optional: set "HEDGE" kalau akun hedge mode
-    positionMode: "ONE_WAY", // "ONE_WAY" | "HEDGE"
+    // ✅ penting untuk hedge mode
+    // AUTO = deteksi via /fapi/v1/positionSide/dual (kalau kamu sudah implement)
+    // ONE_WAY / HEDGE = paksa mode kalau belum implement auto-detect
+    positionMode: "AUTO", // "AUTO" | "ONE_WAY" | "HEDGE"
 
     entryType: "LIMIT",         // "MARKET" atau "LIMIT"
     entryTimeInForce: "IOC",    // kalau LIMIT
-    entrySlipTicks: 1,          // ✅ DIPAKAI di app.js: geser 1 tick untuk improve fill
+    entrySlipTicks: 1,          // kalau LIMIT: geser 1 tick untuk improve fill
 
     exitType: "MARKET",
     recvWindow: 5000,

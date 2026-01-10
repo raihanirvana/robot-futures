@@ -1,3 +1,4 @@
+// src/domain/indicators.js
 export function bollinger(closes, period, stdDevMult) {
   const mean = closes.reduce((a, b) => a + b, 0) / period;
   const variance = closes.reduce((acc, x) => acc + (x - mean) ** 2, 0) / period;

@@ -1,3 +1,4 @@
+// src/domain/series.js
 export function createCloseSeries(maxLen = 500) {
   const buf = [];
 
