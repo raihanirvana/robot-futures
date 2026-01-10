@@ -4,16 +4,15 @@ import WebSocket from "ws";
 const USE_TESTNET = (process.env.BINANCE_USE_TESTNET || "").toLowerCase() === "true";
 const WS_BASE = USE_TESTNET ? "wss://stream.binancefuture.com" : "wss://fstream.binance.com";
 
-// watchdog defaults
-const STALE_MS = 20_000;       // kalau >20s tidak ada message, anggap stale
-const WATCHDOG_MS = 5_000;     // cek setiap 5s
+const STALE_MS = 20_000;
+const WATCHDOG_MS = 5_000;
 
-export function connectMarketWSMulti({ symbols, timeframe, onKlineClosed, onMark }) {
+export function connectMarketWSMulti({ symbols, timeframe, onKlineClosed, onPrice }) {
   const streams = [];
   for (const sym of symbols) {
     const s = sym.toLowerCase();
     streams.push(`${s}@kline_${timeframe}`);
-    streams.push(`${s}@markPrice@1s`);
+    streams.push(`${s}@aggTrade`); // ✅ last price (mirip chart)
   }
 
   const url = `${WS_BASE}/stream?streams=${streams.join("/")}`;
@@ -31,12 +30,10 @@ export function connectMarketWSMulti({ symbols, timeframe, onKlineClosed, onMark
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
-
   function clearWatchdog() {
     if (watchdogTimer) clearInterval(watchdogTimer);
     watchdogTimer = null;
   }
-
   function armWatchdog() {
     clearWatchdog();
     watchdogTimer = setInterval(() => {
@@ -54,7 +51,6 @@ export function connectMarketWSMulti({ symbols, timeframe, onKlineClosed, onMark
     connecting = true;
 
     clearReconnectTimer();
-
     try { ws?.terminate?.(); } catch {}
     ws = new WebSocket(url);
 
@@ -82,10 +78,10 @@ export function connectMarketWSMulti({ symbols, timeframe, onKlineClosed, onMark
               closeTime: k.T
             });
           }
-        } else if (data.e === "markPriceUpdate") {
-          onMark({
+        } else if (data.e === "aggTrade") {
+          onPrice({
             symbol: data.s,
-            markPrice: data.p,
+            price: data.p,     // last price
             eventTime: data.E
           });
         }
@@ -106,19 +102,17 @@ export function connectMarketWSMulti({ symbols, timeframe, onKlineClosed, onMark
   }
 
   function scheduleReconnect() {
-  if (!alive) return;
+    if (!alive) return;
+    if (reconnectTimer) return;
 
-  // ✅ kalau sudah ada timer, jangan schedule lagi (hindari retry double)
-  if (reconnectTimer) return;
-
-  retry += 1;
-  const base = Math.min(30_000, 1000 * (2 ** Math.min(5, retry)));
-  const jitter = Math.floor(Math.random() * 1000);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null; // ✅ reset sebelum connect
-    connect();
-  }, base + jitter);
-}
+    retry += 1;
+    const base = Math.min(30_000, 1000 * (2 ** Math.min(5, retry)));
+    const jitter = Math.floor(Math.random() * 1000);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, base + jitter);
+  }
 
   connect();
 

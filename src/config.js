@@ -13,8 +13,8 @@ export const CFG = {
   tp2Pct: 0.03,
   tp1CloseFrac: 0.5,
 
-  // SL catastrophic relative to BB width
-  slMult: 0.7,
+  // ✅ SL simple: 1% dari entry
+  slPct: 0.01,
 
   sizing: {
     marginUSDT: 60,
@@ -23,15 +23,16 @@ export const CFG = {
   },
 
   guards: {
-    // toggles
+    // ✅ anti spam (touch sekali)
+    armedEnabled: true,  // setelah entry, bot baru boleh entry lagi kalau balik masuk band dulu
+    debounce: true,      // pakai crossing event (prev < trigger lalu >= trigger)
+
+    // (boleh tetap dimatikan)
     cooldownEnabled: false,
     minGapEnabled: false,
     maxTradesEnabled: false,
     killSwitchEnabled: false,
-    armedEnabled: false,
-    debounce: false,
 
-    // defaults aman (tidak undefined)
     cooldownBarsAfterSL: 2,
     minMinutesBetweenEntries: 30,
     maxTradesPerDay: 10,
@@ -44,14 +45,12 @@ export const CFG = {
   },
 
   exec: {
-    // ✅ penting untuk hedge mode
-    // AUTO = deteksi via /fapi/v1/positionSide/dual (kalau kamu sudah implement)
-    // ONE_WAY / HEDGE = paksa mode kalau belum implement auto-detect
-    positionMode: "AUTO", // "AUTO" | "ONE_WAY" | "HEDGE"
+    positionMode: "AUTO",
 
-    entryType: "LIMIT",         // "MARKET" atau "LIMIT"
-    entryTimeInForce: "IOC",    // kalau LIMIT
-    entrySlipTicks: 1,          // kalau LIMIT: geser 1 tick untuk improve fill
+    // ✅ simple & anti IOC spam
+    entryType: "MARKET",       // bisa ganti LIMIT kalau mau, tapi MARKET paling “1x dan beres”
+    entryTimeInForce: "IOC",
+    entrySlipTicks: 1,
 
     exitType: "MARKET",
     recvWindow: 5000,
