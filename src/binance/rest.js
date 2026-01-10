@@ -1,3 +1,4 @@
+// src/binance/rest.js
 import axios from "axios";
 import { signQuery } from "./signer.js";
 
@@ -7,7 +8,8 @@ const API_KEY = process.env.BINANCE_API_KEY;
 const API_SECRET = process.env.BINANCE_API_SECRET;
 
 if (!API_KEY || !API_SECRET) {
-  console.error("Missing BINANCE_API_KEY / BINANCE_API_SECRET env vars.");
+  // ✅ fail-fast: jangan jalan kalau env belum benar
+  throw new Error("Missing BINANCE_API_KEY / BINANCE_API_SECRET env vars.");
 }
 
 const http = axios.create({
@@ -16,7 +18,9 @@ const http = axios.create({
   headers: { "X-MBX-APIKEY": API_KEY }
 });
 
-function ts() { return Date.now(); }
+function ts() {
+  return Date.now();
+}
 
 async function signed(method, path, params = {}) {
   const fullParams = { ...params, timestamp: ts(), recvWindow: params.recvWindow ?? 5000 };
@@ -31,25 +35,39 @@ async function signed(method, path, params = {}) {
   throw new Error(`Unsupported method ${method}`);
 }
 
+function pickFilter(symbolInfo, type) {
+  return symbolInfo?.filters?.find((f) => f.filterType === type) ?? null;
+}
+
 export const BinanceRest = {
-  baseUrl() { return BASE; },
+  baseUrl() {
+    return BASE;
+  },
 
   async exchangeInfo(symbol) {
     const data = (await http.get(`/fapi/v1/exchangeInfo?symbol=${symbol}`)).data;
     const s = data.symbols?.[0];
     if (!s) throw new Error(`Symbol not found in exchangeInfo: ${symbol}`);
 
-    // Prefer MARKET_LOT_SIZE for market orders, fallback to LOT_SIZE
-    const mlot = s.filters.find(f => f.filterType === "MARKET_LOT_SIZE");
-    const lot  = s.filters.find(f => f.filterType === "LOT_SIZE");
-    const price = s.filters.find(f => f.filterType === "PRICE_FILTER");
-    const lotRef = mlot || lot;
+    // qty step
+    const lot = pickFilter(s, "LOT_SIZE");
+    const mlot = pickFilter(s, "MARKET_LOT_SIZE");
+    const price = pickFilter(s, "PRICE_FILTER");
+
+    // ✅ minNotional (kalau ada)
+    // Binance futures exchangeInfo kadang punya MIN_NOTIONAL, kadang tidak tergantung market.
+    const minNotionalF = pickFilter(s, "MIN_NOTIONAL");
+    const notional = minNotionalF?.notional ?? minNotionalF?.minNotional ?? null;
 
     return {
-      stepSize: lotRef?.stepSize ?? "1",
-      minQty: lotRef?.minQty ?? "0",
-      maxQty: lotRef?.maxQty ?? null,              // ✅ NEW
-      tickSize: price?.tickSize ?? "0.00000001"
+      stepSize: lot?.stepSize ?? (mlot?.stepSize ?? "1"),
+      minQty: lot?.minQty ?? (mlot?.minQty ?? "0"),
+      maxQty: lot?.maxQty ?? (mlot?.maxQty ?? null),
+
+      tickSize: price?.tickSize ?? "0.00000001",
+
+      // optional constraint
+      minNotional: notional != null ? String(notional) : null
     };
   },
 

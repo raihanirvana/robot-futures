@@ -1,3 +1,18 @@
+// src/domain/sizing.js
+
+function decimalsFromSize(size) {
+  const s = String(size).trim().toLowerCase();
+
+  // support "1e-8"
+  if (s.includes("e-")) {
+    const m = s.match(/e-(\d+)/);
+    if (m) return Number(m[1]) || 0;
+  }
+
+  if (!s.includes(".")) return 0;
+  return s.split(".")[1].length;
+}
+
 export function roundDownToStep(qty, stepSize) {
   const q = Number(qty);
   const step = Number(stepSize);
@@ -5,8 +20,7 @@ export function roundDownToStep(qty, stepSize) {
   if (!Number.isFinite(q)) return 0;
   if (!Number.isFinite(step) || step <= 0) return q;
 
-  const stepStr = String(stepSize);
-  const decimals = stepStr.includes(".") ? stepStr.split(".")[1].length : 0;
+  const decimals = decimalsFromSize(stepSize);
   const scale = 10 ** Math.min(decimals, 12);
 
   const qInt = Math.floor(q * scale + 1e-9);
@@ -19,9 +33,37 @@ export function roundDownToStep(qty, stepSize) {
 }
 
 /**
+ * Convert qty number -> safe string based on stepSize decimals
+ */
+export function formatQtyByStep(qty, stepSize) {
+  const q = Number(qty);
+  if (!Number.isFinite(q)) return "0";
+
+  const d = decimalsFromSize(stepSize);
+  let out = q.toFixed(Math.min(d, 12));
+  if (out.includes(".")) out = out.replace(/\.?0+$/, "");
+  return out;
+}
+
+/**
+ * Convert price -> safe string based on tickSize decimals
+ */
+export function formatPriceByTick(price, tickSize) {
+  const p = Number(price);
+  if (!Number.isFinite(p)) return "0";
+
+  const d = decimalsFromSize(tickSize);
+  let out = p.toFixed(Math.min(d, 12));
+  if (out.includes(".")) out = out.replace(/\.?0+$/, "");
+  return out;
+}
+
+/**
  * Calculate order qty from desired notional (USDT).
- * If qty < minQty -> return 0 (skip trade). We DO NOT round up silently.
- * ✅ NEW: clamp to maxQty when provided.
+ * - floor to step
+ * - enforce minQty
+ * - clamp maxQty
+ * - ✅ enforce minNotional if provided by rules (best-effort)
  */
 export function calcQtyFromNotional(notionalUSDT, markPrice, rules) {
   const notional = Number(notionalUSDT);
@@ -33,7 +75,8 @@ export function calcQtyFromNotional(notionalUSDT, markPrice, rules) {
 
   const stepSize = Number(rules.stepSize);
   const minQty = Number(rules.minQty);
-  const maxQty = Number(rules.maxQty ?? Infinity); // ✅ NEW
+  const maxQty = Number(rules.maxQty ?? Infinity);
+  const minNotional = rules.minNotional != null ? Number(rules.minNotional) : null;
 
   if (!Number.isFinite(stepSize) || stepSize <= 0) return 0;
   if (!Number.isFinite(minQty) || minQty < 0) return 0;
@@ -41,11 +84,16 @@ export function calcQtyFromNotional(notionalUSDT, markPrice, rules) {
   const qtyRaw = notional / mark;
   let qty = roundDownToStep(qtyRaw, stepSize);
 
-  // ✅ clamp to maxQty if provided
   if (Number.isFinite(maxQty) && maxQty > 0 && qty > maxQty) {
     qty = roundDownToStep(maxQty, stepSize);
   }
 
   if (!Number.isFinite(qty) || qty < minQty) return 0;
+
+  // ✅ minNotional best-effort
+  if (minNotional != null && Number.isFinite(minNotional) && minNotional > 0) {
+    if (qty * mark < minNotional) return 0;
+  }
+
   return qty;
 }

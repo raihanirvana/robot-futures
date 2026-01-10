@@ -23,14 +23,15 @@ export const CFG = {
   },
 
   guards: {
-    // ✅ per-guard toggles
-    cooldownEnabled: false,     // cek cooldownUntil + set cooldown onStopLoss
-    minGapEnabled: false,       // minMinutesBetweenEntries
-    maxTradesEnabled: false,    // maxTradesPerDay
-    killSwitchEnabled: false,   // pausedUntil + stopEvents window
-    armedEnabled: false,        // armedLong/armedShort anti spam
-    debounce: true,            // sudah ada (crossing) vs touch
+    // toggles
+    cooldownEnabled: false,
+    minGapEnabled: false,
+    maxTradesEnabled: false,
+    killSwitchEnabled: false,
+    armedEnabled: false,
+    debounce: false,
 
+    // ✅ defaults aman (tidak undefined)
     cooldownBarsAfterSL: 2,
     minMinutesBetweenEntries: 30,
     maxTradesPerDay: 10,
@@ -43,7 +44,13 @@ export const CFG = {
   },
 
   exec: {
-    entryType: "MARKET",
+    // ✅ optional: set "HEDGE" kalau akun hedge mode
+    positionMode: "ONE_WAY", // "ONE_WAY" | "HEDGE"
+
+    entryType: "LIMIT",         // "MARKET" atau "LIMIT"
+    entryTimeInForce: "IOC",    // kalau LIMIT
+    entrySlipTicks: 1,          // ✅ DIPAKAI di app.js: geser 1 tick untuk improve fill
+
     exitType: "MARKET",
     recvWindow: 5000,
 

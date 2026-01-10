@@ -5,7 +5,7 @@ import { createState, ensureDay, dayKeyJakarta } from "./state.js";
 
 import { createCloseSeries } from "./domain/series.js";
 import { bollinger } from "./domain/indicators.js";
-import { calcQtyFromNotional, roundDownToStep } from "./domain/sizing.js";
+import { calcQtyFromNotional, roundDownToStep, formatQtyByStep } from "./domain/sizing.js";
 import { canEnterNow, onStopLoss } from "./domain/guards.js";
 import {
   updateTriggers,
@@ -30,33 +30,87 @@ function fmt(n, d = 8) {
   return x.toFixed(d);
 }
 
-// Perf logger (session-based)
 const perf = createPerfLogger({ log });
 
-// ✅ clientId generator (anti collision)
 function newCid(prefix, symbol, nowMs) {
   const rand = Math.random().toString(36).slice(2, 8);
   return `${prefix}_${symbol}_${nowMs}_${rand}`;
 }
 
+// ===== Tick helpers =====
+function decimalsFromTick(tickSize) {
+  const s = String(tickSize).trim().toLowerCase();
+  if (s.includes("e-")) {
+    const m = s.match(/e-(\d+)/);
+    if (m) return Number(m[1]) || 0;
+  }
+  if (!s.includes(".")) return 0;
+  return s.split(".")[1].length;
+}
+
+function formatPriceByTick(price, tickSize, side) {
+  const px = Number(price);
+  const tick = Number(tickSize);
+
+  if (!Number.isFinite(px) || px <= 0) return null;
+  if (!Number.isFinite(tick) || tick <= 0) return String(px);
+
+  const steps = px / tick;
+  const roundedSteps =
+    side === "LONG"
+      ? Math.floor(steps + 1e-12)
+      : Math.ceil(steps - 1e-12);
+
+  const outPx = roundedSteps * tick;
+  const d = decimalsFromTick(tickSize);
+
+  let out = outPx.toFixed(Math.min(d, 12));
+  if (out.includes(".")) out = out.replace(/\.?0+$/, "");
+  return out;
+}
+
+// ✅ apply entrySlipTicks
+function computeEntryLimitPrice(st, side) {
+  if (!st.bb) return null;
+  const trigger = side === "LONG" ? st.bb.longTrigger : st.bb.shortTrigger;
+
+  const slipTicks = Number(CFG.exec.entrySlipTicks ?? 0);
+  const tick = Number(st.rules?.tickSize ?? 0);
+
+  if (!Number.isFinite(trigger)) return null;
+  if (!Number.isFinite(slipTicks) || slipTicks === 0) return trigger;
+  if (!Number.isFinite(tick) || tick <= 0) return trigger;
+
+  // LONG: BUY LIMIT -> a bit higher improves fill; SHORT: SELL LIMIT -> a bit lower improves fill
+  const adj = slipTicks * tick;
+  return side === "LONG" ? (trigger + adj) : (trigger - adj);
+}
+
+// ===== Hedge mode helper =====
+function maybeAddPositionSide(order, sideForHedge) {
+  if ((CFG.exec.positionMode || "ONE_WAY") !== "HEDGE") return order;
+
+  // In hedge mode, Binance expects positionSide LONG/SHORT
+  const ps = sideForHedge === "LONG" ? "LONG" : "SHORT";
+  return { ...order, positionSide: ps };
+}
+
 // ===== Per-symbol containers =====
 const SYMS = CFG.symbols;
-const symState = new Map();  // symbol -> state
-const symCloses = new Map(); // symbol -> close series
+const symState = new Map();
+const symCloses = new Map();
 
 for (const s of SYMS) {
   symState.set(s, createState(s));
   symCloses.set(s, createCloseSeries(500));
 }
 
-// ===== User stream & WS handles =====
 let listenKey = null;
 let stopUserWS = null;
 let stopMarketWS = null;
 let keepAliveTimer = null;
 let dayTimer = null;
 
-// ===== Helpers: open orders cleanup =====
 async function cancelAllOpenOrdersForSymbol(symbol) {
   try {
     const orders = await BinanceRest.openOrders(symbol, CFG.exec.recvWindow);
@@ -67,17 +121,9 @@ async function cancelAllOpenOrdersForSymbol(symbol) {
     for (const o of orders) {
       try {
         if (o.orderId) {
-          await BinanceRest.cancelOrder({
-            symbol,
-            orderId: o.orderId,
-            recvWindow: CFG.exec.recvWindow
-          });
+          await BinanceRest.cancelOrder({ symbol, orderId: o.orderId, recvWindow: CFG.exec.recvWindow });
         } else if (o.clientOrderId) {
-          await BinanceRest.cancelOrder({
-            symbol,
-            origClientOrderId: o.clientOrderId,
-            recvWindow: CFG.exec.recvWindow
-          });
+          await BinanceRest.cancelOrder({ symbol, origClientOrderId: o.clientOrderId, recvWindow: CFG.exec.recvWindow });
         }
       } catch (e) {
         log("[BOOT] cancel openOrder FAIL", symbol, o.orderId || o.clientOrderId, e?.response?.data?.msg || e.message);
@@ -106,7 +152,6 @@ async function initSymbol(symbol) {
   await BinanceRest.setLeverage(symbol, CFG.sizing.leverage);
   log("[BOOT]", symbol, "leverage:", CFG.sizing.leverage);
 
-  // ✅ cancel open orders on boot (avoid desync from previous crash)
   await cancelAllOpenOrdersForSymbol(symbol);
 }
 
@@ -116,10 +161,7 @@ async function startUserStream() {
   log("[BOOT] listenKey acquired");
 
   if (stopUserWS) stopUserWS();
-  stopUserWS = connectUserWS({
-    listenKey,
-    onOrderTradeUpdate: handleOrderTradeUpdate
-  });
+  stopUserWS = connectUserWS({ listenKey, onOrderTradeUpdate: handleOrderTradeUpdate });
 
   if (keepAliveTimer) clearInterval(keepAliveTimer);
 
@@ -143,12 +185,23 @@ async function startUserStream() {
 async function safeInit() {
   log("[BOOT] Base:", BinanceRest.baseUrl());
   log("[BOOT] Symbols:", SYMS.join(", "));
-  log("[BOOT] TF:", CFG.timeframe, "BB:", CFG.bb.period, CFG.bb.stdDev, "triggerMult:", CFG.triggerMult, "slMult:", CFG.slMult);
+  log(
+    "[BOOT] TF:",
+    CFG.timeframe,
+    "BB:",
+    CFG.bb.period,
+    CFG.bb.stdDev,
+    "triggerMult:",
+    CFG.triggerMult,
+    "slMult:",
+    CFG.slMult,
+    "entryType:",
+    CFG.exec.entryType
+  );
 
   for (const s of SYMS) await initSymbol(s);
   await startUserStream();
 
-  // Market WS multi
   if (stopMarketWS) stopMarketWS();
   stopMarketWS = connectMarketWSMulti({
     symbols: SYMS,
@@ -159,7 +212,6 @@ async function safeInit() {
 
   log("[BOOT] Market WS started", CFG.timeframe);
 
-  // Daily summary
   if (dayTimer) clearInterval(dayTimer);
   dayTimer = setInterval(() => {
     const now = Date.now();
@@ -168,28 +220,17 @@ async function safeInit() {
       const st = symState.get(s);
       if (!st) continue;
       if (st.tradesDayKey !== day) continue;
-      log(
-        "[DAY]",
-        s,
-        "dayPnL=",
-        st.dayRealizedPnl.toFixed(4),
-        "W/L=",
-        `${st.dayWins}/${st.dayLosses}`,
-        "trades=",
-        st.tradesToday
-      );
+      log("[DAY]", s, "dayPnL=", st.dayRealizedPnl.toFixed(4), "W/L=", `${st.dayWins}/${st.dayLosses}`, "trades=", st.tradesToday);
     }
   }, 5 * 60 * 1000);
 }
 
-// ===== Indicators update from kline close =====
 function handleKlineClosed({ symbol, close, closeTime }) {
   const st = symState.get(symbol);
   const cs = symCloses.get(symbol);
   if (!st || !cs) return;
 
   cs.pushClosed(close);
-
   const lastN = cs.lastN(CFG.bb.period);
   if (!lastN) return;
 
@@ -198,28 +239,24 @@ function handleKlineClosed({ symbol, close, closeTime }) {
   updateTriggers(st, CFG.triggerMult);
 }
 
-// ===== Price helpers =====
 function slPriceBBRelative(st, side) {
   if (!st.bb) return null;
   const { lower, upper, width } = st.bb;
   if (![lower, upper, width].every(Number.isFinite)) return null;
-
   if (side === "LONG") return lower - CFG.slMult * width;
   if (side === "SHORT") return upper + CFG.slMult * width;
   return null;
 }
 
 function tp1Price(entry, side) {
-  if (!Number.isFinite(entry) || entry <= 0) return null;
-  if (side === "LONG") return entry * (1 + CFG.tp1Pct);
-  if (side === "SHORT") return entry * (1 - CFG.tp1Pct);
-  return null;
+  const e = Number(entry);
+  if (!Number.isFinite(e) || e <= 0) return null;
+  return side === "LONG" ? e * (1 + CFG.tp1Pct) : e * (1 - CFG.tp1Pct);
 }
 function tp2Price(entry, side) {
-  if (!Number.isFinite(entry) || entry <= 0) return null;
-  if (side === "LONG") return entry * (1 + CFG.tp2Pct);
-  if (side === "SHORT") return entry * (1 - CFG.tp2Pct);
-  return null;
+  const e = Number(entry);
+  if (!Number.isFinite(e) || e <= 0) return null;
+  return side === "LONG" ? e * (1 + CFG.tp2Pct) : e * (1 - CFG.tp2Pct);
 }
 function hitBEP(mark, entry, side) {
   if (side === "LONG") return mark <= entry;
@@ -242,14 +279,13 @@ function computePartialQty(st, fullQty) {
   return rounded;
 }
 
-// ===== Exchange reconciliation (anti desync) =====
 async function syncPositionFromExchange(st) {
   try {
     const arr = await BinanceRest.positionRisk(st.symbol, CFG.exec.recvWindow);
     const p = Array.isArray(arr) ? arr[0] : null;
     if (!p) return;
 
-    const amt = Number(p.positionAmt || 0); // +long, -short
+    const amt = Number(p.positionAmt || 0);
     const entry = Number(p.entryPrice || 0);
 
     if (!Number.isFinite(amt) || amt === 0) {
@@ -257,6 +293,8 @@ async function syncPositionFromExchange(st) {
       st.tp1Hit = false;
       return;
     }
+
+    if (!st.position) st.position = { side: "NONE", qty: 0, entryPrice: null, entryMark: null };
 
     st.position.side = amt > 0 ? "LONG" : "SHORT";
     st.position.qty = Math.abs(amt);
@@ -266,7 +304,6 @@ async function syncPositionFromExchange(st) {
   }
 }
 
-// ===== Pending safety =====
 async function hardReleaseStuckPending(st, nowMs) {
   if (!st.pending) return false;
   const age = nowMs - (st.pending.since || nowMs);
@@ -285,21 +322,13 @@ async function hardReleaseStuckPending(st, nowMs) {
     if (terminal) {
       await syncPositionFromExchange(st);
       st.pending = null;
-
-      // cleanup open orders too
       await cancelAllOpenOrdersForSymbol(st.symbol);
-
       log("[PENDING] HARD RELEASE terminal -> pending cleared", st.symbol, clientId);
       return true;
     }
 
-    // still open: attempt cancel once
     try {
-      await BinanceRest.cancelOrder({
-        symbol: st.symbol,
-        origClientOrderId: clientId,
-        recvWindow: CFG.exec.recvWindow
-      });
+      await BinanceRest.cancelOrder({ symbol: st.symbol, origClientOrderId: clientId, recvWindow: CFG.exec.recvWindow });
       log("[PENDING] HARD cancel attempted", st.symbol, clientId);
     } catch (e2) {
       log("[PENDING] HARD cancel FAIL", st.symbol, clientId, e2?.response?.data?.msg || e2.message);
@@ -307,8 +336,6 @@ async function hardReleaseStuckPending(st, nowMs) {
 
     await syncPositionFromExchange(st);
     st.pending = null;
-
-    // cleanup open orders too
     await cancelAllOpenOrdersForSymbol(st.symbol);
 
     st.pausedUntil = Math.max(st.pausedUntil || 0, nowMs + 30_000);
@@ -319,8 +346,6 @@ async function hardReleaseStuckPending(st, nowMs) {
     log("[PENDING] HARD getOrder FAIL", st.symbol, clientId, e?.response?.data?.msg || e.message);
     await syncPositionFromExchange(st);
     st.pending = null;
-
-    // cleanup open orders too
     await cancelAllOpenOrdersForSymbol(st.symbol);
 
     st.pausedUntil = Math.max(st.pausedUntil || 0, nowMs + 30_000);
@@ -334,65 +359,84 @@ async function maybeCancelStuckPending(st, nowMs) {
   const age = nowMs - (st.pending.since || nowMs);
   if (age < CFG.exec.pendingTimeoutMs) return;
 
+  if (st.pending.cancelRequestedAt) return; // ✅ cancel once
+  st.pending.cancelRequestedAt = nowMs;
+
   const { clientId, type } = st.pending;
   log("[PENDING] Timeout -> cancel", st.symbol, type, clientId, "ageMs=", age);
 
   try {
-    await BinanceRest.cancelOrder({
-      symbol: st.symbol,
-      origClientOrderId: clientId,
-      recvWindow: CFG.exec.recvWindow
-    });
+    await BinanceRest.cancelOrder({ symbol: st.symbol, origClientOrderId: clientId, recvWindow: CFG.exec.recvWindow });
     log("[PENDING] Cancel OK", st.symbol, clientId);
   } catch (e) {
-    const msg = e?.response?.data?.msg || e.message;
-    log("[PENDING] Cancel FAIL", st.symbol, clientId, msg);
+    log("[PENDING] Cancel FAIL", st.symbol, clientId, e?.response?.data?.msg || e.message);
   }
 }
 
-// ===== Orders =====
 async function enterPosition(st, side, mark, nowMs) {
-  if (side === "LONG") st.armedLong = true;
-  if (side === "SHORT") st.armedShort = true;
+  const armedEnabled = (CFG.guards?.armedEnabled !== false);
+
+  if (armedEnabled) {
+    if (side === "LONG") st.armedLong = true;
+    if (side === "SHORT") st.armedShort = true;
+  }
 
   const qty = calcQtyFromNotional(CFG.sizing.notionalUSDT, mark, st.rules);
   if (qty <= 0) {
     log("[ENTER] Qty too small; skip.", st.symbol, side);
-    if (side === "LONG") st.armedLong = false;
-    if (side === "SHORT") st.armedShort = false;
+    if (armedEnabled) {
+      if (side === "LONG") st.armedLong = false;
+      if (side === "SHORT") st.armedShort = false;
+    }
     return;
   }
 
+  const qtyStr = formatQtyByStep(qty, st.rules?.stepSize);
   const clientId = newCid("E", st.symbol, nowMs);
-  st.pending = {
-    type: "ENTRY",
-    clientId,
-    side,
-    qty,
-    markAtSubmit: mark,
-    since: nowMs
-  };
 
-  log("[ENTER]", st.symbol, side, "mark=", fmt(mark), "qty=", fmt(qty, 8), "cid=", clientId);
+  st.pending = { type: "ENTRY", clientId, side, qty, markAtSubmit: mark, since: nowMs, filledCum: 0 };
 
   try {
-    await BinanceRest.placeOrder({
+    let baseOrder = {
       symbol: st.symbol,
       side: side === "LONG" ? "BUY" : "SELL",
       type: CFG.exec.entryType,
-      quantity: qty,
+      quantity: qtyStr,
       newClientOrderId: clientId,
       recvWindow: CFG.exec.recvWindow
-    });
+    };
+
+    baseOrder = maybeAddPositionSide(baseOrder, side);
+
+    if (CFG.exec.entryType === "LIMIT") {
+      const triggerPx = computeEntryLimitPrice(st, side);
+      if (triggerPx == null) throw new Error("No triggerPx");
+
+      const pxStr = formatPriceByTick(triggerPx, st.rules?.tickSize, side);
+      if (!pxStr) throw new Error("Bad limit price");
+
+      baseOrder.price = pxStr;
+      baseOrder.timeInForce = CFG.exec.entryTimeInForce || "IOC";
+
+      log("[ENTER]", st.symbol, side, "LIMIT", "mark=", fmt(mark), "trigger=", fmt(triggerPx), "price=", pxStr, "qty=", qtyStr, "cid=", clientId);
+    } else {
+      log("[ENTER]", st.symbol, side, "MARKET", "mark=", fmt(mark), "qty=", qtyStr, "cid=", clientId);
+    }
+
+    await BinanceRest.placeOrder(baseOrder);
+
   } catch (e) {
     log("[ENTER] Order failed:", st.symbol, e?.response?.data || e.message);
-    if (side === "LONG") st.armedLong = false;
-    if (side === "SHORT") st.armedShort = false;
+
+    if (armedEnabled) {
+      if (side === "LONG") st.armedLong = false;
+      if (side === "SHORT") st.armedShort = false;
+    }
+
     st.pending = null;
   }
 }
 
-// ✅ store targetPx inside pending for better exit logs
 async function exitPosition(st, reason, mark, nowMs, mode = "FULL", targetPx = null) {
   const side = st.position.side;
   const fullQty = Number(st.position.qty);
@@ -405,7 +449,9 @@ async function exitPosition(st, reason, mark, nowMs, mode = "FULL", targetPx = n
     else mode = "FULL";
   }
 
+  const qtyStr = formatQtyByStep(qty, st.rules?.stepSize);
   const clientId = newCid("X", st.symbol, nowMs);
+
   st.pending = {
     type: "EXIT",
     clientId,
@@ -415,44 +461,33 @@ async function exitPosition(st, reason, mark, nowMs, mode = "FULL", targetPx = n
     qty,
     markAtSubmit: mark,
     since: nowMs,
-    targetPx
+    targetPx,
+    filledCum: 0
   };
 
-  log(
-    "[EXIT]",
-    st.symbol,
-    reason,
-    mode,
-    side,
-    "mark=",
-    fmt(mark),
-    "qty=",
-    fmt(qty, 8),
-    "fullQty=",
-    fmt(fullQty, 8),
-    "target=",
-    targetPx != null ? fmt(targetPx) : "na",
-    "cid=",
-    clientId
-  );
+  log("[EXIT]", st.symbol, reason, mode, side, "mark=", fmt(mark), "qty=", fmt(qty, 8), "fullQty=", fmt(fullQty, 8), "target=", targetPx != null ? fmt(targetPx) : "na", "cid=", clientId);
 
   try {
-    await BinanceRest.placeOrder({
+    let order = {
       symbol: st.symbol,
       side: side === "LONG" ? "SELL" : "BUY",
       type: CFG.exec.exitType,
-      quantity: qty,
+      quantity: qtyStr,
       reduceOnly: true,
       newClientOrderId: clientId,
       recvWindow: CFG.exec.recvWindow
-    });
+    };
+
+    order = maybeAddPositionSide(order, side);
+
+    await BinanceRest.placeOrder(order);
   } catch (e) {
     log("[EXIT] Order failed:", st.symbol, e?.response?.data || e.message);
     st.pending = null;
   }
 }
 
-// ===== Mark processing with queue (NO DROP TICKS) =====
+// latest mark overwrite
 function handleMark(payload) {
   const st = symState.get(payload.symbol);
   if (!st) return;
@@ -494,21 +529,33 @@ async function processMark(st, { markPrice }) {
     return;
   }
 
-  // pending: cancel only if timed out; hard release if too old
+  // pending: allow catastrophic SL even while pending EXIT/ENTRY
   if (st.pending) {
-    // If ENTRY partially filled (position exists), still protect catastrophic SL
-    if (st.pending.type === "ENTRY" && st.position.side !== "NONE" && Number(st.position.qty) > 0) {
-      const side = st.position.side;
+    const side = st.position.side;
+    const hasPos = (side !== "NONE" && Number(st.position.qty) > 0);
+
+    if (hasPos) {
       const entry = st.position.entryPrice ?? st.position.entryMark ?? mark;
       const slBB = slPriceBBRelative(st, side);
 
       if (slBB != null) {
-        if (side === "LONG" && mark <= slBB) {
-          await exitPosition(st, "SL_BB", mark, nowWall, "FULL", slBB);
-          st.prevMark = mark;
-          return;
-        }
-        if (side === "SHORT" && mark >= slBB) {
+        const slHit =
+          (side === "LONG" && mark <= slBB) ||
+          (side === "SHORT" && mark >= slBB);
+
+        if (slHit) {
+          try {
+            if (st.pending?.clientId) {
+              await BinanceRest.cancelOrder({ symbol: st.symbol, origClientOrderId: st.pending.clientId, recvWindow: CFG.exec.recvWindow });
+              log("[PENDING] cancel before SL attempt", st.symbol, st.pending.clientId);
+            }
+          } catch (e) {
+            log("[PENDING] cancel before SL FAIL", st.symbol, st.pending?.clientId, e?.response?.data?.msg || e.message);
+          }
+
+          st.pending = null;
+          await cancelAllOpenOrdersForSymbol(st.symbol);
+
           await exitPosition(st, "SL_BB", mark, nowWall, "FULL", slBB);
           st.prevMark = mark;
           return;
@@ -523,9 +570,10 @@ async function processMark(st, { markPrice }) {
     return;
   }
 
-  resetArmedOnReenterBand(st, mark);
+  const armedEnabled = (CFG.guards?.armedEnabled !== false);
+  resetArmedOnReenterBand(st, mark, armedEnabled);
 
-  // ===== EXIT MANAGEMENT =====
+  // EXIT management
   if (st.position.side !== "NONE") {
     const side = st.position.side;
     const entry = st.position.entryPrice ?? st.position.entryMark ?? mark;
@@ -534,89 +582,50 @@ async function processMark(st, { markPrice }) {
     const t1 = tp1Price(entry, side);
     const t2 = tp2Price(entry, side);
 
-    // 0) catastrophic SL
     if (slBB != null) {
-      if (side === "LONG" && mark <= slBB) {
-        await exitPosition(st, "SL_BB", mark, nowWall, "FULL", slBB);
-        st.prevMark = mark;
-        return;
-      }
-      if (side === "SHORT" && mark >= slBB) {
-        await exitPosition(st, "SL_BB", mark, nowWall, "FULL", slBB);
-        st.prevMark = mark;
-        return;
-      }
+      if (side === "LONG" && mark <= slBB) { await exitPosition(st, "SL_BB", mark, nowWall, "FULL", slBB); st.prevMark = mark; return; }
+      if (side === "SHORT" && mark >= slBB) { await exitPosition(st, "SL_BB", mark, nowWall, "FULL", slBB); st.prevMark = mark; return; }
     }
 
-    // 1) TP1 partial
     if (!st.tp1Hit && t1 != null) {
-      if (side === "LONG" && mark >= t1) {
-        await exitPosition(st, "TP1", mark, nowWall, "PARTIAL", t1);
-        st.prevMark = mark;
-        return;
-      }
-      if (side === "SHORT" && mark <= t1) {
-        await exitPosition(st, "TP1", mark, nowWall, "PARTIAL", t1);
-        st.prevMark = mark;
-        return;
-      }
+      if (side === "LONG" && mark >= t1) { await exitPosition(st, "TP1", mark, nowWall, "PARTIAL", t1); st.prevMark = mark; return; }
+      if (side === "SHORT" && mark <= t1) { await exitPosition(st, "TP1", mark, nowWall, "PARTIAL", t1); st.prevMark = mark; return; }
     }
 
-    // 2) after TP1: return to BEP
     if (st.tp1Hit && hitBEP(mark, entry, side)) {
       await exitPosition(st, "BEP", mark, nowWall, "FULL", entry);
       st.prevMark = mark;
       return;
     }
 
-    // 3) TP2 full
     if (t2 != null) {
-      if (side === "LONG" && mark >= t2) {
-        await exitPosition(st, "TP2", mark, nowWall, "FULL", t2);
-        st.prevMark = mark;
-        return;
-      }
-      if (side === "SHORT" && mark <= t2) {
-        await exitPosition(st, "TP2", mark, nowWall, "FULL", t2);
-        st.prevMark = mark;
-        return;
-      }
+      if (side === "LONG" && mark >= t2) { await exitPosition(st, "TP2", mark, nowWall, "FULL", t2); st.prevMark = mark; return; }
+      if (side === "SHORT" && mark <= t2) { await exitPosition(st, "TP2", mark, nowWall, "FULL", t2); st.prevMark = mark; return; }
     }
 
     st.prevMark = mark;
     return;
   }
 
-  // ===== ENTRY =====
+  // ENTRY
   if (!canEnterNow(st, CFG, nowWall)) {
     st.prevMark = mark;
     return;
   }
 
-  const longSignal = CFG.guards.debounce
-    ? crossedLongTrigger(st, mark)
-    : (mark <= st.bb.longTrigger);
+  const longSignal = CFG.guards.debounce ? crossedLongTrigger(st, mark) : (mark <= st.bb.longTrigger);
+  const shortSignal = CFG.guards.debounce ? crossedShortTrigger(st, mark) : (mark >= st.bb.shortTrigger);
 
-  const shortSignal = CFG.guards.debounce
-    ? crossedShortTrigger(st, mark)
-    : (mark >= st.bb.shortTrigger);
+  const allowLong = armedEnabled ? (!st.armedLong) : true;
+  const allowShort = armedEnabled ? (!st.armedShort) : true;
 
-  if (!st.armedLong && longSignal) {
-    await enterPosition(st, "LONG", mark, nowWall);
-    st.prevMark = mark;
-    return;
-  }
-
-  if (!st.armedShort && shortSignal) {
-    await enterPosition(st, "SHORT", mark, nowWall);
-    st.prevMark = mark;
-    return;
-  }
+  if (allowLong && longSignal) { await enterPosition(st, "LONG", mark, nowWall); st.prevMark = mark; return; }
+  if (allowShort && shortSignal) { await enterPosition(st, "SHORT", mark, nowWall); st.prevMark = mark; return; }
 
   st.prevMark = mark;
 }
 
-// ===== User stream handler =====
+// ✅ EXIT partial fill safe using cum delta
 function handleOrderTradeUpdate(msg) {
   try {
     const o = msg.o;
@@ -633,46 +642,44 @@ function handleOrderTradeUpdate(msg) {
     const status = o.X;          // NEW, PARTIALLY_FILLED, FILLED, CANCELED, REJECTED, EXPIRED
     const side = o.S;            // BUY / SELL
     const avgPrice = Number(o.ap || 0);
-    const filledQty = Number(o.z || 0);
+    const cumFilledQty = Number(o.z || 0);
+    const lastFillPrice = Number(o.L || 0);
     const clientId = o.c;
 
     const terminal = (status === "FILLED" || status === "CANCELED" || status === "REJECTED" || status === "EXPIRED");
 
-    // Not our pending -> still refine entryPrice
     if (!st.pending || st.pending.clientId !== clientId) {
-      if ((status === "FILLED" || status === "PARTIALLY_FILLED") && filledQty > 0) {
+      if ((status === "FILLED" || status === "PARTIALLY_FILLED") && cumFilledQty > 0) {
         if (st.position.side === "LONG" && side === "BUY") st.position.entryPrice = avgPrice || st.position.entryPrice;
         if (st.position.side === "SHORT" && side === "SELL") st.position.entryPrice = avgPrice || st.position.entryPrice;
       }
       return;
     }
 
-    // ===== Pending ENTRY =====
+    // ENTRY pending
     if (st.pending.type === "ENTRY") {
-      if (status === "PARTIALLY_FILLED" && filledQty > 0) {
+      if (status === "PARTIALLY_FILLED" && cumFilledQty > 0) {
         const newSide = (side === "BUY") ? "LONG" : "SHORT";
         st.position.side = newSide;
-        st.position.qty = filledQty;
+        st.position.qty = cumFilledQty;
         st.position.entryPrice = avgPrice || st.position.entryPrice;
         st.position.entryMark = st.pending.markAtSubmit ?? null;
         return;
       }
 
-      if (status === "FILLED" && filledQty > 0) {
+      if (status === "FILLED" && cumFilledQty > 0) {
         const newSide = (side === "BUY") ? "LONG" : "SHORT";
         st.position.side = newSide;
-        st.position.qty = filledQty;
+        st.position.qty = cumFilledQty;
         st.position.entryPrice = avgPrice || null;
         st.position.entryMark = st.pending.markAtSubmit ?? null;
 
         st.tp1Hit = false;
-
         st.tradesToday += 1;
         st.lastEntryAt = nowWall;
 
         const entryRef = Number(st.position.entryPrice ?? st.position.entryMark ?? 0);
 
-        // capture targets for logger session
         const tp1 = tp1Price(entryRef, st.position.side);
         const tp2 = tp2Price(entryRef, st.position.side);
         const sl = slPriceBBRelative(st, st.position.side);
@@ -681,7 +688,7 @@ function handleOrderTradeUpdate(msg) {
           symbol,
           side: st.position.side,
           entryPrice: entryRef,
-          qty: filledQty,
+          qty: cumFilledQty,
           nowMs: nowWall,
           clientId,
           tp1,
@@ -689,7 +696,7 @@ function handleOrderTradeUpdate(msg) {
           sl
         });
 
-        log("[USER] ENTRY FILLED", symbol, "cid=", clientId, "side=", st.position.side, "entry=", fmt(entryRef), "qty=", fmt(filledQty, 8));
+        log("[USER] ENTRY FILLED", symbol, "cid=", clientId, "side=", st.position.side, "entry=", fmt(entryRef), "qty=", fmt(cumFilledQty, 8));
 
         st.pending = null;
         return;
@@ -697,118 +704,86 @@ function handleOrderTradeUpdate(msg) {
 
       if (terminal && status !== "FILLED") {
         log("[USER] ENTRY terminal(not filled)", symbol, clientId, "status=", status);
-        if (st.pending.side === "LONG") st.armedLong = false;
-        if (st.pending.side === "SHORT") st.armedShort = false;
+
+        const armedEnabled = (CFG.guards?.armedEnabled !== false);
+        if (armedEnabled) {
+          if (st.pending.side === "LONG") st.armedLong = false;
+          if (st.pending.side === "SHORT") st.armedShort = false;
+        }
+
         st.pending = null;
         return;
       }
       return;
     }
 
-    // ===== Pending EXIT =====
+    // EXIT pending
     if (st.pending.type === "EXIT") {
-      if (status === "FILLED") {
+      const prevCum = Number(st.pending.filledCum || 0);
+      const currCum = Number.isFinite(cumFilledQty) ? cumFilledQty : 0;
+      const deltaQty = Math.max(0, currCum - prevCum);
+
+      if (deltaQty > 0) {
+        st.pending.filledCum = currCum;
+
         const reason = st.pending.reason;
         const mode = st.pending.mode;
 
         const entryRef = Number(st.position.entryPrice ?? st.position.entryMark ?? 0);
-        const exitPx = Number(avgPrice || 0);
-        const qtyClosed = Number(filledQty || 0);
+        const fillPx = (Number.isFinite(lastFillPrice) && lastFillPrice > 0)
+          ? lastFillPrice
+          : (Number.isFinite(avgPrice) && avgPrice > 0 ? avgPrice : 0);
 
-        log(
-          "[USER] EXIT FILLED",
-          symbol,
-          "cid=",
-          clientId,
-          "reason=",
-          reason,
-          "mode=",
-          mode,
-          "exit=",
-          fmt(exitPx),
-          "qty=",
-          fmt(qtyClosed, 8),
-          "target=",
-          st.pending.targetPx != null ? fmt(st.pending.targetPx) : "na"
-        );
-
-        // PnL (USDT) based on closed qty
         let pnlUSDT = 0;
-        if (qtyClosed > 0 && entryRef > 0 && exitPx > 0) {
+        if (deltaQty > 0 && entryRef > 0 && fillPx > 0) {
           pnlUSDT = (st.position.side === "LONG")
-            ? (exitPx - entryRef) * qtyClosed
-            : (entryRef - exitPx) * qtyClosed;
+            ? (fillPx - entryRef) * deltaQty
+            : (entryRef - fillPx) * deltaQty;
 
           st.dayRealizedPnl += pnlUSDT;
           if (pnlUSDT >= 0) st.dayWins += 1;
           else st.dayLosses += 1;
         }
 
-        if (reason === "SL_BB") {
-          onStopLoss(st, CFG, nowWall);
-          log(
-            "[GUARD] SL confirmed",
-            symbol,
-            "cooldownUntil=",
-            new Date(st.cooldownUntil).toISOString(),
-            "pausedUntil=",
-            st.pausedUntil ? new Date(st.pausedUntil).toISOString() : "none"
-          );
-        }
+        const newQty = Math.max(0, Number(st.position.qty) - deltaQty);
+        st.position.qty = newQty;
 
-        if (mode === "PARTIAL") {
-          const newQty = Math.max(0, Number(st.position.qty) - qtyClosed);
-          st.position.qty = newQty;
+        if (reason === "TP1") st.tp1Hit = true;
 
-          if (reason === "TP1") st.tp1Hit = true;
-
-          // logger: record exit (not final unless qty becomes 0)
-          perf.recordExit({
-            symbol,
-            reason,
-            mode,
-            exitPrice: exitPx,
-            qtyClosed,
-            pnlUSDT,
-            nowMs: nowWall,
-            clientId,
-            targetPx: st.pending.targetPx ?? null,
-            remainingQty: newQty,
-            isFinal: newQty <= 0
-          });
-
-          if (newQty <= 0) {
-            st.position = { side: "NONE", qty: 0, entryPrice: null, entryMark: null };
-            st.tp1Hit = false;
-          }
-
-          st.pending = null;
-          return;
-        }
-
-        // FULL close -> finalize session
         perf.recordExit({
           symbol,
           reason,
           mode,
-          exitPrice: exitPx,
-          qtyClosed,
+          exitPrice: fillPx,
+          qtyClosed: deltaQty,
           pnlUSDT,
           nowMs: nowWall,
           clientId,
           targetPx: st.pending.targetPx ?? null,
-          remainingQty: 0,
-          isFinal: true
+          remainingQty: newQty,
+          isFinal: newQty <= 0
         });
 
-        st.position = { side: "NONE", qty: 0, entryPrice: null, entryMark: null };
-        st.tp1Hit = false;
+        log("[USER] EXIT FILL", symbol, "cid=", clientId, "reason=", reason, "mode=", mode, "fill=", fmt(fillPx), "deltaQty=", fmt(deltaQty, 8), "remaining=", fmt(newQty, 8));
+
+        if (newQty <= 0) {
+          st.position = { side: "NONE", qty: 0, entryPrice: null, entryMark: null };
+          st.tp1Hit = false;
+        }
+
+        if (reason === "SL_BB") {
+          onStopLoss(st, CFG, nowWall);
+          log("[GUARD] SL confirmed", symbol, "cooldownUntil=", new Date(st.cooldownUntil).toISOString(), "pausedUntil=", st.pausedUntil ? new Date(st.pausedUntil).toISOString() : "none");
+        }
+      }
+
+      if (status === "FILLED") {
         st.pending = null;
         return;
       }
 
       if (terminal && status !== "FILLED") {
-        log("[USER] EXIT terminal(not filled)", symbol, clientId, "status=", status);
+        log("[USER] EXIT terminal", symbol, clientId, "status=", status, "cumQty=", fmt(cumFilledQty, 8));
         st.pending = null;
         return;
       }
@@ -817,11 +792,10 @@ function handleOrderTradeUpdate(msg) {
     }
 
   } catch {
-    // keep silent (match your style)
+    // silent
   }
 }
 
-// ✅ graceful shutdown
 let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;
@@ -834,27 +808,19 @@ async function shutdown(signal) {
   try { if (keepAliveTimer) clearInterval(keepAliveTimer); } catch {}
   try { if (dayTimer) clearInterval(dayTimer); } catch {}
 
-  // best-effort: cancel any pending + open orders
   for (const s of SYMS) {
     const st = symState.get(s);
     if (!st) continue;
 
     try {
       if (st.pending?.clientId) {
-        await BinanceRest.cancelOrder({
-          symbol: s,
-          origClientOrderId: st.pending.clientId,
-          recvWindow: CFG.exec.recvWindow
-        });
+        await BinanceRest.cancelOrder({ symbol: s, origClientOrderId: st.pending.clientId, recvWindow: CFG.exec.recvWindow });
       }
     } catch {}
 
-    try {
-      await cancelAllOpenOrdersForSymbol(s);
-    } catch {}
+    try { await cancelAllOpenOrdersForSymbol(s); } catch {}
   }
 
-  // print totals on exit
   try { perf.printTotals(); } catch {}
 
   log("[SYS] shutdown complete");
